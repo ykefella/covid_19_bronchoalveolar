@@ -1,0 +1,512 @@
+---
+title: "Harmony Analysis Pipeline"
+output: html_notebook
+---
+
+=============================================================================
+
+        FILE: Harmony_Analysis_With_Seurat.Rmd
+
+        USAGE: Follow the documentation and execute each chunk accordingly to run the analysis.
+
+        AUTHOR: Samuel Bunga (sb), bunga.s@northeastern.edu, Yohana Kefella Kefella.y@northeastern.edu
+
+
+=============================================================================
+
+
+# Description:
+### What is harmony:
+It is an algorithm for performing integration of single cell genomics datasets.
+The emerging diversity of single-cell RNA-seq datasets allows for the full transcriptional characterization of cell types across a wide variety of biological and clinical conditions. However, it is challenging to analyze them together, particularly when datasets are assayed with different technologies, because biological and technical differences are interspersed. 
+
+Harmony is an algorithm that projects cells into a shared embedding in which cells group by cell type rather than dataset-specific conditions.
+
+If you haven't installed it already:
+```
+devtools::install_github("immunogenomics/harmony")
+```
+
+**Note**: Please make sure you are running on R version **3.6.3** to avoid any installation issues.
+
+### Goal of this pipeline:
+1. To integrate multiple Seurat datasets and use Harmony embeddings for the later down stream analysis of the pipeline.
+
+2. To find the differentially expressed markers between all the clusters and between treatment conditions.
+
+3. To annotate the clusters by enrichment analysis using GSEApy (Python package).
+
+4. Visualize all the above steps by plotting appropriate plots.
+
+
+### R Color pallete guide:
+```
+http://www.stat.columbia.edu/~tzheng/files/Rcolor.pdf
+```
+#### Shades of green
+```
+green <- c('chartreuse1', 'chartreuse2', 'chartreuse3', 'chartreuse4', 'green1', 'green2', 'green3', 'green4')
+```
+#### Shades of red
+
+```
+red <- c('firebrick1', 'firebrick2', 'firebrick3', 'firebrick4', 'orangered1', 'orangered2', 'orangered3', 'orangered4', 'red1', 'red2', 'red3', 'red4') 
+```
+
+### Load libraries
+```{r}
+library(Seurat)
+library(sctransform)
+library(cowplot)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(harmony)
+library(data.table)
+library(reticulate)
+```
+
+### Set outputpath
+```{r}
+# please change the below path to the output directory of your choice
+main.dir <- file.path("Z:/Tutorials/Single_Cell_RNA/Outputs/Covid_Batch2_harmony/")
+# Create directories before running the analysis
+# Directory to store QC results
+dir.create(file.path(main.dir, "QC"), showWarnings = FALSE, recursive = T)
+dir.create(file.path(main.dir, "Rds"), showWarnings = FALSE, recursive = T)
+
+```
+
+
+### Functions
+```{r}
+sc_gsea_marker_extraction <- function(
+    file = file,
+    cell_name,
+    main.dir
+){
+    if(is.null(cell_name)){
+        return("Please give the cell name.")
+    }
+    cell.markers <- FindMarkers(object = file, ident.1 = cell_name)
+    marker_mtx <- cell.markers[order(cell.markers$avg_logFC, decreasing = T), ]
+    marker_mtx <- setDT(marker_mtx, keep.rownames = 'gene')[]
+    marker_mtx <- subset(marker_mtx, select = c("gene", "avg_logFC"))
+    file_name <- paste("sc", cell_name, sep = "_")
+    dir_name <- paste(file_name, "rnk", sep = ".")
+    cluster_loc <- paste(main.dir, "cluster_rnks", sep = "/")
+    dir.create(cluster_loc, showWarnings = FALSE)
+    loc <- paste(cluster_loc, dir_name, sep = "/")
+    write.table(marker_mtx, loc, sep = "\t", row.names = FALSE, col.names = F)
+}
+
+group_samples <- function(
+  samples_list, Treatments, Dataset  
+){
+  t <- c()
+  l <- list()
+  
+for (i in 1:length(samples_list)) {
+  for (j in 1:length(samples_list[[i]])) {
+   t <- c(t, which(Dataset$conditions == all_conditions[[i]][j])) 
+  }
+ l[[Treatments[i]]] <- t
+ t <- c()
+  }
+ return(l) 
+}
+
+```
+
+
+### Loading the sample objects
+```{r}
+# Get the location of the samples
+sample_loc <- c('GSM4339769_C141_filtered_feature_bc_matrix.h5',
+'GSM4339770_C142_filtered_feature_bc_matrix.h5','GSM4339771_C143_filtered_feature_bc_matrix.h5', 'GSM4339772_C144_filtered_feature_bc_matrix.h5','GSM4339773_C145_filtered_feature_bc_matrix.h5','GSM4339774_C146_filtered_feature_bc_matrix.h5', 'GSM4475048_C51_filtered_feature_bc_matrix.h5','GSM4475049_C52_filtered_feature_bc_matrix.h5','GSM4475050_C100_filtered_feature_bc_matrix.h5','GSM4475051_C148_filtered_feature_bc_matrix.h5','GSM4475052_C149_filtered_feature_bc_matrix.h5','GSM4475053_C152_filtered_feature_bc_matrix.h5'
+)
+
+samples <- c()
+Names <- c('C141', 'C142', 'C143', 'C144', 'C145', 'C146', 'C51', 'C52', 'C100', 'C148', 'C149', 'C152')
+for (i in 1:length(sample_loc)) {
+    # You can simply use Read10X for non hdf5 datasets
+    samples <- c(samples, Read10X_h5(sample_loc[i]))
+    names(samples)[i] <- Names[i]
+  }
+```
+
+
+
+
+### Pre-process all the samples and add them into a list object
+```{r}
+# Create an empty list
+object.list <- list()
+
+for (i in 1:length(sample_loc)) {
+  
+  each_dataset <- CreateSeuratObject(counts = samples[[Names[i]]], min.cells = 3, min.features = 200, project = Names[[i]])
+  each_dataset[["percent.mt"]] <- PercentageFeatureSet(each_dataset, pattern = "^MT-")
+  
+  # Visualize QC metrics in a violin plot
+  png(paste0(main.dir, "/QC/VlnPlot_",i,".tiff"), units="in", width=10, height=6, res=300)
+  print(VlnPlot(each_dataset, features = c("nFeature_RNA", "nCount_RNA","percent.mt"), ncol = 3))
+  dev.off()
+  maxRNA = readline(paste0(Names[[i]]," Max nfeature RNA:"))
+  each_dataset <- subset(each_dataset, subset = nFeature_RNA > 200 & nFeature_RNA < maxRNA & percent.mt < 15)
+  object.list <- c(object.list, each_dataset)
+  rm(each_dataset)
+}
+```
+
+
+### Merge the processed object
+```{r}
+mergedAll<- merge(object.list[[1]], y=object.list[2:length(object.list)], project = "covid_merged")
+```
+
+### SCTransform the merged objects
+```{r}
+# Note: This single command replaces NormalizeData, ScaleData, and FindVariableFeatures.
+mergedAll <- SCTransform(mergedAll, vars.to.regress = c("nCount_RNA","percent.mt"), return.only.var.genes = F)
+
+```
+
+
+### Run PCA and harmony
+```{r}
+mergedAll <- RunPCA(mergedAll, npcs = 20)
+
+png(paste0(main.dir, "/pca_plot_before_harmony.tiff"), units="in", width=10, height=6, res=300)
+print(DimPlot(object = mergedAll, reduction = "pca", pt.size = .1, group.by = "orig.ident"))
+dev.off()
+
+png(paste0(main.dir, "/run-harmony-plot.tiff"), units="in", width=10, height=6, res=300)
+mergedAll <- mergedAll %>% RunHarmony("orig.ident", plot_convergence = TRUE, assay.use="SCT")
+dev.off()
+
+png(paste0(main.dir, "/dimplot_harmony.tiff"), units="in", width=10, height=6, res=300)
+print(DimPlot(object = mergedAll, reduction = "harmony", pt.size = .1, group.by = "orig.ident"))
+dev.off()
+
+png(paste0(main.dir,"/elbow-plot-before-harmony.jpg"), units="in", width=10, height=6, res=300)
+p1 <- ElbowPlot(mergedAll, reduction = "pca")
+plot(p1)
+dev.off()
+
+png(paste0(main.dir,"/elbow-plot-after-harmony.jpg"), units="in", width=10, height=6, res=300)
+p1 <- ElbowPlot(mergedAll, reduction = "harmony")
+plot(p1)
+dev.off()
+```
+
+### Access harmony embeddings
+```{r}
+harmony_embeddings <- Embeddings(mergedAll, 'harmony')
+harmony_embeddings[1:5, 1:5]
+
+```
+
+
+### Downstream analysis using Seurat
+```{r}
+mergedAll <- mergedAll %>% 
+    RunUMAP(reduction = "harmony", dims = 1:17) %>% 
+    FindNeighbors(reduction = "harmony", dims = 1:17) %>% 
+    FindClusters(resolution = 0.5) %>% 
+    identity()
+
+```
+
+
+
+### Split the samples into condition groups
+```{r}
+# ** Note: Please change the below conditions to match your analysis before running this chunk **
+# Creating a new slot to store the original identities
+mergedAll[['conditions']] <- mergedAll$orig.ident
+
+# Creating vectors based on different conditions
+mild_condition <- c('C141', 'C142', 'C144')
+severe_condition <- c('C143', 'C145', 'C146', 'C148', 'C149', 'C152')
+healthy_condition <- c('C100', 'C51', 'C52')
+
+
+
+all_conditions <- list(mild_condition, severe_condition, healthy_condition)
+
+g <- group_samples(samples_list = all_conditions, Treatments = c("Mild", "Severe", "Healthy"), mergedAll)
+
+mergedAll$conditions[g$Mild] <- "Mild"
+mergedAll$conditions[g$Severe] <- "Severe"
+mergedAll$conditions[g$Healthy] <- "Healthy"
+
+```
+
+
+### Visualization of downstream analysis
+```{r}
+
+# Dimplot of conditions
+png(paste0(main.dir,"/umap-samples-splitby-conditions.tiff"), units="in", width=10, height=6, res=300)
+DimPlot(mergedAll, reduction = "umap", group.by = "orig.ident", pt.size = .1, label=T, split.by = 'conditions', cols = c('chartreuse1', 'firebrick1', 'firebrick2', 'brown4', 'red1', '#BA110C', 'orangered4', 'firebrick4', 'darkred', 'red4', 'chartreuse2', 'chartreuse3'))
+dev.off()
+
+# Group by all the samples
+p1 <- DimPlot(mergedAll, reduction = "umap", group.by = "orig.ident", cols = c('chartreuse1', 'firebrick1', 'firebrick2', 'brown4', 'red1', '#BA110C', 'orangered4', 'firebrick4', 'darkred', 'red4', 'chartreuse2', 'chartreuse3'))
+p2 <- DimPlot(mergedAll, reduction = "umap", label = TRUE)
+png(paste0(main.dir,"/UMAP-samples-cluster-label.png"), units="in", width=10, height=6, res=300)
+print(plot_grid(p1, p2))
+dev.off()
+
+# Group by treatment
+png(paste0(main.dir,"/UMAP-groupby-condition.png"), units="in", width=10, height=6, res=300)
+DimPlot(mergedAll, reduction = "umap", group.by = "conditions", cols = c('chartreuse2', 'firebrick1', 'darkred'))
+dev.off()
+
+# Split by condition and label the clusters
+png(paste0(main.dir, "/UMAP-splitby-treatment-label-clusters.png"), units="in", width=10, height=6, res=300)
+DimPlot(mergedAll, reduction = "umap", split.by = "conditions", label = T)
+dev.off()
+
+# Label clusters
+png(paste0(main.dir, "/UMAP-label-clusters.png"), units="in", width=10, height=6, res=300)
+DimPlot(mergedAll, reduction = "umap", label = T)
+dev.off()
+
+# Frequency plot of condition distribution across clusters
+png(paste0(main.dir,"/stacked-barplot-by-identity",".png"), units="in", width=10, height=6, res=300)
+ggplot(mergedAll@meta.data, aes(x=seurat_clusters, fill=orig.ident)) + geom_bar(position = "fill") + scale_fill_manual(values=c('chartreuse1', 'firebrick1', 'firebrick2', 'brown4', 'red1', '#BA110C', 'orangered4', 'firebrick4', 'darkred', 'red4', 'chartreuse2', 'chartreuse3')) +
+  labs(fill="Conditions")
+dev.off()
+
+png(paste0(main.dir,"/stacked-barplot-by-condition",".png"), units="in", width=10, height=6, res=300)
+ggplot(mergedAll@meta.data, aes(x=seurat_clusters, fill=conditions)) + geom_bar(position = "fill") + scale_fill_manual(values=c('chartreuse2', 'firebrick1', 'darkred')) +
+  labs(fill="Conditions")
+dev.off()
+```
+
+
+### Identify differentially expressed markers between conditions
+```{r}
+# Notes:
+# The min.pct argument requires a feature to be detected at a minimum percentage in either of the two groups of cells,
+
+
+
+# find all markers distinguishing between the specified cluster(s)
+severe_clusters <- c(1, 3, 4, 6, 7, 12, 13, 14, 15, 16, 18, 19)
+healthy_clusters <- c(0, 2, 8, 10)
+mild_clusters <- c(17)
+
+mild_vs_all <- FindMarkers(mergedAll, ident.1 = mild_clusters, min.pct = 0.25)
+mild-VS-all-top20 <- head((row.names(mild_vs_all)),20)
+
+severe_vs_healthy <- FindMarkers(mergedAll, ident.1 = severe_clusters, ident.2 = healthy_clusters, min.pct = 0.25)
+severe_healthy_top20 <- head((row.names(severe_vs_healthy)),20)
+saveRDS(severe_vs_healthy, paste0(main.dir,"/Rds/severe-vs-healthy.Rds"))
+
+severe_vs_all <- FindMarkers(mergedAll, ident.1 = severe_clusters, min.pct = 0.25)
+severe_all_top20 <- head((row.names(severe_vs_all)),20)
+saveRDS( severe_vs_all, paste0(main.dir,"/Rds/severe-vs-all.Rds"))
+
+
+healthy_vs_severe <- FindMarkers(mergedAll, ident.1 = healthy_clusters, ident.2 = severe_clusters, min.pct = 0.25)
+healthy_vs_severe <- head((row.names(healthy_vs_severe)),20)
+saveRDS(healthy_vs_severe, paste0(main.dir,"/Rds/healthy-vs-severe.Rds"))
+
+healthy_vs_all <- FindMarkers(mergedAll, ident.1 = healthy_clusters, min.pct = 0.25)
+healthy_all_top20 <- head((row.names(healthy_vs_all)),20)
+saveRDS(healthy_vs_all, paste0(main.dir,"/Rds/healthy-vs-all.Rds"))
+```
+
+
+
+### Identify differentially expressed genes across all clusters
+```{r}
+# find markers for every cluster compared to all remaining cells, report only the positive ones
+all_markers <- FindAllMarkers(mergedAll, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+# Write the markers into a csv formatted file
+write.csv(all_markers, paste0(main.dir,"/all_markers.csv"), row.names = F, col.names = T)
+
+
+```
+
+
+### Heatmap of DE genes
+```{r}
+# Top 5 markers from each cluster
+top5 <- all_markers %>% group_by(cluster) %>% top_n(n = 5, wt = avg_logFC)
+
+# Plotting against clusters
+# Save as tiff
+tiff(paste0(main.dir,"/heatmap-all-markers.tiff"), units="in", width=25, height=10, res=200)
+p1 <- DoHeatmap(mergedAll, features = top5$gene, assay = "SCT") + NoLegend()
+print(p1)
+dev.off()
+
+# Save as pdf
+p1 <- DoHeatmap(mergedAll, features = top5$gene, assay = "SCT")
+ggplot2::ggsave(filename = paste0(main.dir, "heatmap-top5.pdf"), plot = p1, units = "in", width = 8, height = 10)
+dev.off()
+
+p2 <- DoHeatmap(mergedAll, features = severe_all_top20, assay = "SCT", group.by = "conditions")
+ggplot2::ggsave(filename = paste0(main.dir, "/heatmap-top20-severeVSall.pdf"), plot = p2, units = "in", width = 8, height = 10)
+dev.off()
+
+p3 <- DoHeatmap(mergedAll, features = mild_all_top20, assay = "SCT", group.by = "conditions")
+ggplot2::ggsave(filename = paste0(main.dir, "/heatmap-top20-mildVSall.pdf"), plot = p3, units = "in", width = 8, height = 10)
+dev.off()
+
+p4 <- DoHeatmap(mergedAll, features = top5$gene, assay = "SCT", group.by = "conditions")
+ggplot2::ggsave(filename = paste0(main.dir, "/heatmap-top5-allClustersVSconditions.pdf"), plot = p4, units = "in", width = 8, height = 10)
+dev.off()
+# Plotting against all the samples
+png(paste0(main.dir,"heatmap-top20-severe-all-samplewise.png"), units="in", width=10, height=6, res=300)
+DoHeatmap(mergedAll, features = severe_all_top20, group.by = "orig.ident", group.colors = c('chartreuse1', 'firebrick1', 'firebrick2', 'brown4', 'red1', '#BA110C', 'orangered4', 'firebrick4', 'darkred', 'red4', 'chartreuse2', 'chartreuse3')) + NoLegend()
+dev.off()
+
+# Plotting against conditions - top 20 markers
+p2 <- DoHeatmap(mergedAll, features = severe_all_top20, group.by = "conditions", group.colors = c('chartreuse2', 'firebrick1', 'darkred'))
+ggplot2::ggsave(filename = paste0(main.dir, "/heatmap-top20-severeVSall"), plot = p1, units = "in", width = 8, height = 10)
+dev.off()
+
+
+
+```
+
+### Dotplots
+```{r}
+png(paste0(main.dir,"/healthy-dotplot-inflammation-condition.png"), units="in", width=10, height=6, res=300)
+DotPlot(mergedAll, features = healthy_all_top20, dot.scale = 8, 
+    group.by = "conditions") + RotatedAxis()
+dev.off()
+
+png(paste0(main.dir,"/healthy-dotplot-cluster.png"), units="in", width=10, height=6, res=300)
+DotPlot(mergedAll, features = healthy_all_top20, dot.scale = 8, 
+    group.by = "seurat_clusters") + RotatedAxis()
+dev.off()
+
+png(paste0(main.dir,"/main-markers-conditions.png"), units="in", width=10, height=6, res=300)
+DotPlot(mergedAll, features = main_markers, dot.scale = 8, 
+    group.by = "conditions") + RotatedAxis()
+dev.off()
+
+png(paste0(main.dir,"/main-markers-clusters.png"), units="in", width=10, height=6, res=300)
+DotPlot(mergedAll, features = main_markers, dot.scale = 8, 
+    group.by = "seurat_clusters") + RotatedAxis()
+dev.off()
+
+png(paste0(main.dir,"/immume-suprs-clusters.png"), units="in", width=10, height=6, res=300)
+DotPlot(mergedAll, features = immune_suprs_markers, dot.scale = 8, 
+    group.by = "seurat_clusters") + RotatedAxis()
+dev.off()
+
+png(paste0(main.dir,"/immume-suprs-conditions.png"), units="in", width=10, height=6, res=300)
+DotPlot(mergedAll, features = immune_suprs_markers, dot.scale = 8, 
+    group.by = "conditions") + RotatedAxis()
+dev.off()
+```
+
+
+### Create rank files for GSEA analysis
+```{r}
+# Creating a vector with the size of clusters present
+clusters <- as.integer(levels(mergedAll$seurat_clusters))
+
+for (each_cluster in clusters) {
+  Cell_name <- each_cluster
+  File <- mergedAll
+  sc_gsea_marker_extraction(file=File, cell_name = Cell_name, main.dir = main.dir)
+  
+}
+```
+
+
+### Run GSEA pipeline
+```{r}
+use_condaenv("BINF6200")
+exe <- paste0("python C:/Users/sambu/PycharmProjects/Dev/RNA-Seq/GSEApy/GSEApy.py -i ", main.dir,"/cluster_rnks/ -o ", main.dir, " -gmt C:/Users/sambu/PycharmProjects/Dev/RNA-Seq/GSEApy/Database/Human/immune_geneset.human.gmt")
+
+system(exe)
+
+```
+
+### Annotate the clusters
+```{r}
+mergedAll <- RenameIdents(mergedAll, `0` = "CD1c+/CD141+", `1` = "CD4+ T", `2` = "MHC Class II", `3` = "CD8+ T", `4` = "CD4+ T", `5` = "CD4+ T", `6` = "CD1c+/CD141+", `7` = "CD4+ T", `8` = "Luminal", `9` = "CD1C B", `10` = "CD8+ T", `11` = "Basal Myoepithelial", `12` = "MHC Class II", `13` = "CD1C B", `14` = "CD1c+/CD141+",  `15`="CD4+ T", `16`="CD1C B", `17` = "Basal", `18` = "Meyloid cells 2", `19` = "M2 Macrophage")
+
+png(paste0(main.dir, "/UMAP_annotated.png"), units="in", width=10, height=6, res=300)
+print(DimPlot(mergedAll, label = TRUE))
+dev.off()
+```
+
+
+### Important markers
+```{r}
+main_markers <- unique(c("APOC1", "MNDA", "FCN1", "FCER1G", "CD14", "CD64", "FCGR1A", "SPP1", "CD3E", 
+                         "CD8A","CD16","FABP4", "CD38", "SRGN", "CD24", "TMPRSS4", "CD9", "CD55", "CD3",
+                         "CD8A", "GNLY", "IL32","JCHAIN", "MZB1" ))
+
+immune_suprs_markers <- unique(c("LILRB4", "LILRB1", "LAIR1", "LY6E", "LAG3", "EVL"))
+```
+
+
+### Featureplots
+```{r}
+png(paste0(main.dir, "/featureplot1.png"), units="in", width=10, height=6, res=300)
+FeaturePlot(mergedAll, features = c('ITGAM', 'TSPAN33'), reduction = "umap")
+dev.off()
+```
+
+
+### Scratch chunk
+```{r}
+macro_markers <- unique(c('CD9', 'FABP4', 'FCER1G', 'APOC1', 'MARCO', 'FCGR1A', 'CD14', 'FCER1G', 'FCN1', 'MNDA', 'SPP1', 'FABP5'))
+
+tcells_NK_CTL <- c('D7', 'IL7R', 'IL32', 'CD4', 'CD8', 'XCL1', 'TRAC', 'CD27', 'KLRD1', 'GZMA', 'GZMB', 'PRF1', 'COROIA', 'LAG3', 'GZMH', 'GZMK', 'CLIC3', 'NKG7')
+
+png(paste0(main.dir,"/dotplot-custom_tnk_marksers.png"), units="in", width=10, height=6, res=300)
+DotPlot(mergedAll, features = tcells_NK_CTL, dot.scale = 5, 
+    group.by = "seurat_clusters", ) + RotatedAxis() + scale_colour_gradient2(low =c("grey"), mid = c("yellow"), high =c("red"))
+dev.off()
+
+
+
+
+
+
+
+DE_1 <- FindMarkers(mergedAll, ident.1 = c(2, 8, 17), ident.2 = c(1, 3, 4, 13), min.pct = 0.25, logfc.threshold = 1)
+
+DE_2 <- FindMarkers(mergedAll, ident.1 = c(16, 5, 9), min.pct = 0.25, logfc.threshold = 1)
+
+DE_3 <- FindMarkers(mergedAll, ident.1 = 0, ident.2 =c(1, 11), min.pct = 0.25, logfc.threshold = 1)
+
+DE_4 <- FindMarkers(mergedAll, ident.1 = c(0,2,8,10,17), ident.2 = c(1,3,4,7,13), min.pct=0.25, logfc.threshold=1)
+DE_5 <- FindMarkers(mergedAll, ident.1 = c(1,3,4,7,13), ident.2 = c(0,2,8,10,17), min.pct=0.25, logfc.threshold=1)
+
+
+
+Features <- c('CLU', 'RNASE2', 'CYP1B1', 'C19orf59', 'IFITM3', 'HP', 'ANPEP', 'IFI27', 'SLC11A1', 'MAPK14', 'PADI4', 'F5', 'CKAP4', 'HMGB2', 'PLAC8')
+Features1 <- c('LTB', 'IL7R', 'CD3E', 'CD2', 'CCL5', 'GIMAP7', 'CD3D', 'CORO1A', 'PTPRCAP', 'RPS3', 'RPS12', 'CD7', 'RAC2', 'CD69', 'IFITM1', 'RPL30', 'RPSA', 'RPS15A', 'SPOCK2', 'LIMD2', 'BTG1', 'RPS27', 'TRBC2')
+
+
+genes_uniquely_DE = all.markers %>% dplyr::filter(avg_logFC >= 1) %>% group_by(gene) %>%  summarize(n=n()) %>%  dplyr::filter(n==1)
+
+png(paste0(main.dir,"/dotplot-custom-6-conditions.png"), units="in", width=10, height=6, res=300)
+DotPlot(mergedAll, features = Features1, dot.scale = 8, 
+    group.by = "conditions") + RotatedAxis() + scale_colour_gradient2(low =c("grey"), mid = c("yellow"), high =c("red"))
+dev.off()
+
+
+d1 <- read.csv("C:/Users/sambu/PycharmProjects/AWS/out/markers/16-5-9.csv", header=T)
+cat(paste(d1$X),  collapse = ", ")
+
+
+p1 <- DoHeatmap(mergedAll, features = row.names(DE_4), assay = "SCT")
+ggplot2::ggsave(filename = paste0(main.dir, "/heatmap-DE_4.pdf"), plot = p1, units = "in", width = 8, height = 10)
+
+```
+
